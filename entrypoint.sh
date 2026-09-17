@@ -26,16 +26,29 @@ echo "  (there is an upstream report, ggml-org/llama.cpp#18684, of" \
      "landed under ${CACHE_DIR} before trusting that restarts won't" \
      "re-download it.)"
 
-# The Dockerfile asserts /llama-server exists at BUILD time and symlinks
-# it onto PATH. This runtime resolution is a second, independent check,
-# not the only line of defense -- if it ever fails, the build-time
-# assertion should already have caught the underlying cause first.
-LLAMA_SERVER_BIN="$(command -v llama-server || echo /llama-server)"
-if [ ! -x "$LLAMA_SERVER_BIN" ]; then
-  echo "FATAL: could not find an executable llama-server at" \
-       "'${LLAMA_SERVER_BIN}'. This should have been caught at build" \
-       "time by the Dockerfile's assertion -- rebuild the image." >&2
+# The Dockerfile searches the base image for llama-server at BUILD time
+# and fails the build outright if it isn't found anywhere -- confirmed
+# necessary in practice, since the upstream binary location has moved
+# at least once between /llama-server and /app/llama-server across
+# different builds of this floating tag. Because the Dockerfile only
+# ever completes successfully when /usr/local/bin/llama-server is a
+# valid symlink to wherever the real binary actually landed, this
+# runtime check can simply trust that symlink rather than guessing a
+# second hardcoded path -- guessing a "corrected" path here would repeat
+# the exact mistake that just broke the build.
+LLAMA_SERVER_BIN="$(command -v llama-server || true)"
+if [ -z "$LLAMA_SERVER_BIN" ] || [ ! -x "$LLAMA_SERVER_BIN" ]; then
+  echo "FATAL: llama-server not found on PATH inside the running" \
+       "container. This should be impossible -- the Dockerfile's" \
+       "build-time discovery step fails the build outright if the" \
+       "binary can't be located, so a passing build should always" \
+       "produce a working symlink. If you're seeing this, the image" \
+       "you're running doesn't match the Dockerfile in this repo" \
+       "(stale pull, wrong tag, or a build that predates this fix)." >&2
   exit 1
+fi
+if [ -f /usr/local/share/llama-server.origin ]; then
+  echo "llama-server binary resolved from: $(cat /usr/local/share/llama-server.origin)"
 fi
 
 echo "== GPU detection (nvidia-smi) =="
@@ -52,18 +65,6 @@ nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader || {
 }
 
 # --- CUDA backend pre-flight check --------------------------------------
-# "llama-server --version" initializes the real ggml_cuda_init path and
-# prints "found N CUDA devices" / "Device X: compute capability Y.Z"
-# without loading any model or downloading anything -- confirmed against
-# real bug reports run on this exact image. Run it before spending
-# minutes and bandwidth on a 15-27 GiB model pull.
-#
-# Limitation, stated plainly: a device being FOUND here does not
-# guarantee every later CUDA call succeeds (documented real case:
-# sm_110/Thor-class hardware listing cleanly, then failing at
-# cublasCreate). This catches "no device at all" with certainty and
-# downgrades "wrong architecture compiled in" from a silent post-download
-# crash into an early warning, not a guarantee.
 echo "== llama-server CUDA backend pre-flight check =="
 CUDA_PROBE_LOG="$(mktemp)"
 if ! timeout 30 "$LLAMA_SERVER_BIN" --version >"$CUDA_PROBE_LOG" 2>&1; then
@@ -85,13 +86,6 @@ if ! grep -q "found [0-9]\+ CUDA device" "$CUDA_PROBE_LOG"; then
 fi
 
 SUPPORTED_CCS="7.5 8.0 8.6 8.9 9.0 12.0"
-# Fixed: this command substitution is a plain (non-local) assignment, so
-# under `set -e` a failing pipeline here would silently kill the whole
-# script before the fallback handling below ever runs -- `local var=$(cmd)`
-# masks a failing substitution's exit status via `local`'s own return
-# value, but a bare top-level `VAR=$(cmd)` does not. Appending `|| true`
-# to the innermost pipeline prevents a "no matches found" grep from
-# aborting the script.
 DETECTED_CCS="$(grep -oE 'compute capability [0-9]+\.[0-9]+' "$CUDA_PROBE_LOG" \
   | grep -oE '[0-9]+\.[0-9]+' | sort -u || true)"
 
@@ -109,10 +103,6 @@ else
       *)
         echo "WARNING: detected compute capability ${cc} is outside this" \
              "image's documented default build list (${SUPPORTED_CCS})." \
-             "ggml_cuda_init found the device, but later inference calls" \
-             "(e.g. cublasCreate) have been known to fail on architectures" \
-             "the binary wasn't compiled for, even when the device listing" \
-             "itself succeeds (documented on sm_110/Thor-class hardware)." \
              "If inference errors out after this point, pin a newer base" \
              "image build that explicitly covers compute capability ${cc}." >&2
         UNSUPPORTED_FOUND=1
@@ -130,12 +120,6 @@ else
 fi
 rm -f "$CUDA_PROBE_LOG"
 
-# Fixed: nvidia-smi can interleave warning text (driver/XID/ECC errors)
-# with its CSV output even when --format=csv,noheader is requested --
-# this is a well-documented real-world nvidia-smi behavior on degraded
-# hardware. Filter to numeric-only lines before doing arithmetic on them,
-# since a stray warning string would abort the script under `set -e`
-# arithmetic evaluation.
 mapfile -t GPU_MEM_MIB < <(nvidia-smi --query-gpu=memory.total \
   --format=csv,noheader,nounits 2>/dev/null | grep -E '^[0-9]+$')
 GPU_COUNT=${#GPU_MEM_MIB[@]}
@@ -155,20 +139,6 @@ TOTAL_GIB=$(( TOTAL_MIB / 1024 ))
 
 echo "Detected ${GPU_COUNT} GPU(s), summed VRAM: ${TOTAL_GIB} GiB (${TOTAL_MIB} MiB)"
 
-# --- Multi-GPU overhead deduction ---------------------------------------
-# In llama.cpp's default layer-split mode, model weights are NOT
-# duplicated across GPUs -- each GPU holds a distinct subset of layers,
-# so summing raw VRAM is a reasonable starting point for weight capacity.
-# What summing does NOT account for is that each additional GPU brings
-# its own CUDA runtime/context overhead (roughly 1-1.5 GiB), separate
-# from the ~1.0-1.5 GiB already assumed for GPU #1 in the single-GPU
-# tier thresholds below. `--fit on` applies its own per-device safety
-# margin at actual launch time, but that protects context/layer sizing
-# GIVEN a quant that basically fits -- it can't rescue a quant tier that
-# was fundamentally oversized for the real multi-GPU overhead before
-# --fit ever runs. Deduct a fixed 1.5 GiB per GPU beyond the first as a
-# heuristic safety margin; this is a defensible estimate based on known
-# per-device CUDA context cost, not a benchmarked exact figure.
 if [ "$GPU_COUNT" -gt 1 ]; then
   MULTI_GPU_PENALTY_GIB=$(( (GPU_COUNT - 1) * 3 / 2 ))
   TOTAL_GIB=$(( TOTAL_GIB - MULTI_GPU_PENALTY_GIB ))
@@ -178,7 +148,6 @@ if [ "$GPU_COUNT" -gt 1 ]; then
        "Adjusted total for tier selection: ${TOTAL_GIB} GiB."
 fi
 
-# --- Vision toggle -------------------------------------------------------
 ENABLE_VISION="${ENABLE_VISION:-1}"
 VISION_BRIDGE="${VISION_BRIDGE:-standard}"
 VISION_RESERVE_GIB=2
@@ -205,7 +174,6 @@ else
   echo "Vision explicitly disabled (ENABLE_VISION=0). Running text-only."
 fi
 
-# --- Quant tier selection -----------------------------------------------
 if [ -n "${QUANT_OVERRIDE:-}" ]; then
   QUANT="$QUANT_OVERRIDE"
   echo "QUANT_OVERRIDE set: forcing quant '${QUANT}' regardless of detected VRAM."
@@ -249,16 +217,6 @@ echo "Selected quant tier: ${QUANT}"
 
 : "${API_KEY:?Set the API_KEY environment variable on the RunPod pod before starting.}"
 
-# --- Vision projector: explicit download, not repo-scanning auto-detect -
-# Rather than rely on "-hf"'s own mmproj-auto repo-listing heuristic
-# (which works for this specific repo -- the model author's own README
-# documents a verified llama-server load test -- but is still a
-# convention-based guess, not a hard guarantee), download the exact
-# named projector file directly and pass it via the officially documented
-# "--mmproj <local_file>" flag, confirmed compatible alongside "-hf" for
-# the main model in llama.cpp's own multimodal docs. If the download
-# fails (transient network issue, HF outage), degrade gracefully to
-# text-only for this session rather than aborting the whole pod.
 MMPROJ_FLAG="--no-mmproj"
 if [ "$VISION_ACTIVE" -eq 1 ]; then
   MMPROJ_LOCAL_PATH="${CACHE_DIR}/${MMPROJ_FILENAME}"
@@ -300,11 +258,6 @@ echo "  cache dir  : ${LLAMA_CACHE}"
 echo "  gpu count  : ${GPU_COUNT}"
 echo "  vision     : ${VISION_ACTIVE}"
 
-# --n-gpu-layers is intentionally left at its default ('auto') and
-# --fit on (llama-server's native default) so the engine itself decides
-# how many layers fit on whatever card(s) actually showed up, leaving a
-# safety margin per device. On multi-GPU pods, omitting --tensor-split
-# makes llama.cpp auto-balance proportionally to each card's free memory.
 exec "$LLAMA_SERVER_BIN" \
   -hf "${REPO}:${QUANT}" \
   --host 0.0.0.0 \

@@ -4,28 +4,41 @@
 # --- PIN THIS BEFORE PRODUCTION USE ---
 # ":server-cuda" is a floating tag. Run:
 #   docker run --rm --gpus all ghcr.io/ggml-org/llama.cpp:server-cuda --version
-# note the printed build tag (e.g. b10955), then change FROM below to the
-# matching immutable tag once you've confirmed a pod boots cleanly.
-# Do NOT hardcode an old/arbitrary build number without verifying it --
-# builds before roughly the six-to-seven-thousand range predate the
-# --fit flag this entrypoint relies on unconditionally, and older builds
-# also predate this model's hybrid-architecture support entirely.
+# note the printed build tag, then change FROM below to the matching
+# immutable tag once you've confirmed a pod boots cleanly.
 FROM ghcr.io/ggml-org/llama.cpp:server-cuda
 
 LABEL maintainer="Stephen Whitehurst" \
       description="Qwen3.8-27B RVN Heretic Abliterated Uncensored GGUF, auto GPU-tiered llama-server on RunPod, vision enabled by default"
 
-# --- Build-time binary path assertion --------------------------------
-# The upstream image copies the binary to /llama-server (filesystem
-# root) and sets ENTRYPOINT ["/llama-server"] by absolute path, confirmed
-# against three independent Dockerhub mirror layer listings. Rather than
-# discover a path mismatch at runtime on a rented GPU pod, fail the
-# BUILD itself (free, in CI) if that assumption ever stops holding.
-RUN test -f /llama-server || \
-    (echo "BUILD ERROR: /llama-server not found in base image -- upstream" \
-          "install location may have changed. Update this Dockerfile's" \
-          "assumption before proceeding." >&2 && exit 1)
-RUN ln -sf /llama-server /usr/local/bin/llama-server
+# --- Dynamic binary discovery (build-time) -----------------------------
+# The upstream image's binary install location is NOT stable across
+# builds of this floating tag: confirmed empirically -- a build on
+# 2026-09-17 failed to find the binary at /llama-server (the location
+# confirmed via multiple independent Dockerhub mirror layer listings
+# earlier), and a separate mirror snapshot dated just ~2 weeks earlier
+# (2026-09-05) showed it landing at /app/llama-server instead, alongside
+# a very recent upstream commit ("add llama in all docker images",
+# #25035) that reorganized .devops/cuda.Dockerfile. Hardcoding either
+# path is the same mistake twice. Instead, search the image at BUILD
+# time and symlink whatever is actually found -- this makes the image
+# self-adapting to future upstream reorganizations instead of breaking
+# again the next time the layout shifts. If the binary genuinely can't
+# be found anywhere reasonable, fail the BUILD (free, in CI) with a
+# diagnostic listing, rather than failing at runtime on a rented GPU pod.
+RUN set -eu; \
+    FOUND_BIN="$(find / -xdev -maxdepth 6 -type f -name 'llama-server' 2>/dev/null | head -n 1)"; \
+    if [ -z "$FOUND_BIN" ]; then \
+        echo "BUILD ERROR: llama-server binary not found anywhere in the" >&2; \
+        echo "base image (searched depth 6 from /). Upstream layout has" >&2; \
+        echo "changed beyond a simple path shift. Inspect manually with:" >&2; \
+        echo "  docker run --rm --entrypoint sh ghcr.io/ggml-org/llama.cpp:server-cuda -c 'find / -xdev -iname \"*llama*\" -type f 2>/dev/null'" >&2; \
+        exit 1; \
+    fi; \
+    if [ ! -x "$FOUND_BIN" ]; then chmod +x "$FOUND_BIN"; fi; \
+    echo "Found llama-server at: ${FOUND_BIN}"; \
+    ln -sf "$FOUND_BIN" /usr/local/bin/llama-server; \
+    echo "$FOUND_BIN" > /usr/local/share/llama-server.origin
 
 # Persist the GGUF cache on the RunPod Network Volume, not the
 # ephemeral container disk. Set every env var llama.cpp's cache
@@ -50,11 +63,6 @@ ENV STRICT_CUDA_CHECK=0
 WORKDIR /app
 
 # --- CRLF sanitization -------------------------------------------------
-# If entrypoint.sh is ever edited or checked out with CRLF line endings
-# (Windows editors, some git autocrlf configurations), Linux's shebang
-# resolution breaks with "/bin/bash^M: bad interpreter". Strip \r before
-# marking it executable so this can't happen regardless of how the file
-# was edited upstream of this build.
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN sed -i 's/\r$//' /usr/local/bin/entrypoint.sh && \
     chmod +x /usr/local/bin/entrypoint.sh
