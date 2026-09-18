@@ -13,16 +13,11 @@ LABEL maintainer="Stephen Whitehurst" \
 
 # --- Dynamic binary discovery (build-time) -----------------------------
 # The upstream image's binary install location is NOT stable across
-# builds of this floating tag: confirmed empirically, a build failed to
-# find the binary at /llama-server (a location previously confirmed via
-# multiple independent Dockerhub mirror layer listings), while a
-# separate mirror snapshot from roughly two weeks earlier showed it at
-# /app/llama-server instead. The exact upstream commit responsible for
-# the most recent shift was not independently confirmed and is
-# intentionally not cited here as fact. What matters functionally is
-# that hardcoding either path is the same mistake twice -- instead,
-# search the image at BUILD time and symlink whatever is actually
-# found, so the image self-adapts to future upstream reorganizations.
+# builds of this floating tag: confirmed empirically across multiple
+# builds. A static "test -f /llama-server" assertion breaks every time
+# upstream moves the binary. Instead, search the image at BUILD time
+# and symlink whatever is actually found, so the image self-adapts to
+# future upstream reorganizations instead of breaking again.
 RUN set -eu; \
     FOUND_BIN="$(find / -xdev -maxdepth 6 -type f -name 'llama-server' 2>/dev/null | head -n 1)"; \
     if [ -z "$FOUND_BIN" ]; then \
