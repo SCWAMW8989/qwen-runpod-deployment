@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 # Verification and telemetry script for the Qwen3.8-27B RVN Heretic
-# RunPod deployment. Run from iSH, macOS, or any terminal with curl + jq.
+# RunPod deployment.
+#
+# On iSH specifically: Alpine's default shell is ash, not bash, and
+# bash is NOT installed by default (confirmed -- this trips up nearly
+# everyone who first tries to run a bash script on Alpine/iSH). Before
+# running this script on iSH:
+#   apk add bash jq
 #
 # Usage:
 #   ./verify.sh <base_url> <api_key> [ssh_target] [image_path]
-#
-#   image_path is optional. If given and the pod was started with
-#   ENABLE_VISION=1 (the default), this also sends a base64-encoded
-#   vision request to confirm the mmproj projector actually loaded.
 set -euo pipefail
 
 if [ "$#" -lt 2 ]; then
@@ -36,15 +38,38 @@ fi
 echo "Health check passed."
 echo
 
-echo "== Authenticated model listing =="
+# NOTE: /v1/models sits in llama-server's hardcoded public_endpoints
+# allowlist (confirmed against the server's own source) alongside
+# /health -- it returns 200 with or without a valid Authorization
+# header. This call is still useful to confirm the model loaded and
+# report its ID, but it does NOT validate API_KEY. The real key check
+# is the dedicated negative test below.
+echo "== Model listing (note: this endpoint does not require auth) =="
 MODELS_STATUS=$(curl -s -o /tmp/models.json -w "%{http_code}" \
   -H "Authorization: Bearer ${API_KEY}" \
   "${BASE_URL}/v1/models")
 cat /tmp/models.json
 echo
 if [ "$MODELS_STATUS" != "200" ]; then
-  echo "FATAL: /v1/models returned HTTP ${MODELS_STATUS}. Check API_KEY." >&2
+  echo "FATAL: /v1/models returned HTTP ${MODELS_STATUS} -- unexpected," \
+       "since this endpoint should respond regardless of auth. The" \
+       "server itself may not be up yet." >&2
   exit 1
+fi
+echo
+
+echo "== API key validation (negative test) =="
+BAD_KEY_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+  -H "Authorization: Bearer this-is-deliberately-wrong" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"qwen3.8-27b-rvn","messages":[{"role":"user","content":"test"}],"max_tokens":1}' \
+  "${BASE_URL}/v1/chat/completions")
+if [ "$BAD_KEY_STATUS" = "401" ]; then
+  echo "Correctly rejected a wrong key (HTTP 401). API_KEY enforcement is active."
+else
+  echo "WARNING: expected HTTP 401 for a deliberately wrong key, got" \
+       "${BAD_KEY_STATUS} instead. Either the server isn't enforcing" \
+       "--api-key, or something else is misconfigured." >&2
 fi
 echo
 
@@ -70,7 +95,9 @@ ELAPSED_MS=$(( (END_NS - START_NS) / 1000000 ))
 
 echo "HTTP status: ${HTTP_STATUS}"
 if [ "$HTTP_STATUS" != "200" ]; then
-  echo "FATAL: chat completion request failed." >&2
+  echo "FATAL: chat completion request failed (this call DOES validate" \
+       "your real API_KEY -- a 401 here means the key you passed to this" \
+       "script doesn't match --api-key on the pod)." >&2
   cat /tmp/completion.json >&2
   exit 1
 fi
@@ -102,15 +129,24 @@ if [ -n "$IMAGE_PATH" ]; then
     echo "WARNING: image path '${IMAGE_PATH}' not found, skipping vision test." >&2
   else
     echo "== Vision test: mmproj projector check =="
+    # Fixed: MIME type is now derived from the actual file extension
+    # instead of being hardcoded to image/jpeg regardless of input.
+    case "${IMAGE_PATH,,}" in
+      *.png)  IMG_MIME="image/png" ;;
+      *.webp) IMG_MIME="image/webp" ;;
+      *.gif)  IMG_MIME="image/gif" ;;
+      *.jpg|*.jpeg|*) IMG_MIME="image/jpeg" ;;
+    esac
+
     B64_IMAGE=$(base64 < "$IMAGE_PATH" | tr -d '\n')
-    VISION_PAYLOAD=$(jq -n --arg img "$B64_IMAGE" '{
+    VISION_PAYLOAD=$(jq -n --arg img "$B64_IMAGE" --arg mime "$IMG_MIME" '{
       model: "qwen3.8-27b-rvn",
       messages: [
         {
           role: "user",
           content: [
             {type: "text", text: "Describe this image in one sentence."},
-            {type: "image_url", image_url: {url: ("data:image/jpeg;base64," + $img)}}
+            {type: "image_url", image_url: {url: ("data:" + $mime + ";base64," + $img)}}
           ]
         }
       ],
@@ -126,13 +162,11 @@ if [ -n "$IMAGE_PATH" ]; then
     VEND_NS=$(date +%s%N)
     VELAPSED_S=$(awk "BEGIN { printf \"%.3f\", (${VEND_NS}-${VSTART_NS})/1000000000 }")
 
-    echo "HTTP status: ${VISION_STATUS}  (${VELAPSED_S}s)"
+    echo "HTTP status: ${VISION_STATUS}  (${VELAPSED_S}s, MIME: ${IMG_MIME})"
     if [ "$VISION_STATUS" != "200" ]; then
-      echo "FATAL: vision request failed. If ENABLE_VISION was explicitly set" \
-           "to 0 on the pod, this is expected: the projector was never" \
-           "loaded. Otherwise check pod logs for a failed mmproj download" \
-           "(entrypoint.sh degrades to text-only on download failure, which" \
-           "would also explain a failure here)." >&2
+      echo "FATAL: vision request failed. If ENABLE_VISION was explicitly" \
+           "set to 0 on the pod, this is expected. Otherwise check pod" \
+           "logs for a failed mmproj download." >&2
       cat /tmp/vision.json >&2
       exit 1
     fi
@@ -146,14 +180,11 @@ METRICS_STATUS=$(curl -s -o /tmp/metrics.txt -w "%{http_code}" \
   -H "Authorization: Bearer ${API_KEY}" \
   "${BASE_URL}/metrics")
 if [ "$METRICS_STATUS" != "200" ]; then
-  echo "WARNING: /metrics returned HTTP ${METRICS_STATUS}. entrypoint.sh" \
-       "passes --metrics unconditionally, so this endpoint should normally" \
-       "be reachable -- a non-200 here doesn't block using the model, but" \
-       "is worth investigating if you rely on this for monitoring." >&2
+  echo "WARNING: /metrics returned HTTP ${METRICS_STATUS}." >&2
 else
   echo "Key counters since server start:"
   grep -E '^llamacpp:(prompt_tokens_total|tokens_predicted_total|prompt_tokens_seconds|predicted_tokens_seconds|requests_processing|requests_deferred) ' \
-    /tmp/metrics.txt | sed 's/^/  /' || echo "  (no matching metric lines found -- raw output saved to /tmp/metrics.txt)"
+    /tmp/metrics.txt | sed 's/^/  /' || echo "  (no matching metric lines found)"
 fi
 echo
 
