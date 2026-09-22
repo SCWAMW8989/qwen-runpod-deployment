@@ -27,6 +27,13 @@ if [ -f /usr/local/share/llama-server.origin ]; then
   echo "llama-server binary resolved from: $(cat /usr/local/share/llama-server.origin)"
 fi
 
+if [ -f /usr/local/share/ggml-backend-path.origin ]; then
+  export GGML_BACKEND_PATH="$(cat /usr/local/share/ggml-backend-path.origin)"
+  echo "GGML_BACKEND_PATH set to: ${GGML_BACKEND_PATH}"
+else
+  echo "WARNING: no recorded GGML backend plugin directory found. CUDA backend discovery will rely on default search paths only." >&2
+fi
+
 echo "== GPU detection (nvidia-smi) =="
 if ! command -v nvidia-smi >/dev/null 2>&1; then
   echo "FATAL: nvidia-smi not found." >&2
@@ -45,7 +52,7 @@ if ! timeout 30 "$LLAMA_SERVER_BIN" --version >"$CUDA_PROBE_LOG" 2>&1; then
 fi
 
 echo "Raw ggml_cuda_init output:"
-grep -E "ggml_cuda_init|Device [0-9]+:|CUDA devices" "$CUDA_PROBE_LOG" | sed 's/^/  /' || true
+cat "$CUDA_PROBE_LOG" | sed 's/^/  /'
 
 if ! grep -q "found [0-9]\+ CUDA device" "$CUDA_PROBE_LOG"; then
   echo "FATAL: llama-server's CUDA backend never reported finding a device." >&2
