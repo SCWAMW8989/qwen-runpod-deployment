@@ -11,23 +11,50 @@ FROM ghcr.io/ggml-org/llama.cpp:server-cuda
 LABEL maintainer="Stephen Whitehurst" \
       description="Qwen3.8-27B RVN Heretic Abliterated Uncensored GGUF, auto GPU-tiered llama-server on RunPod, vision enabled by default"
 
-# --- Dynamic binary discovery (build-time) -----------------------------
-# The upstream image's binary install location is NOT stable across
-# builds of this floating tag: confirmed empirically across multiple
-# builds. A static "test -f /llama-server" assertion breaks every time
-# upstream moves the binary. Instead, search the image at BUILD time
-# and symlink whatever is actually found, so the image self-adapts to
-# future upstream reorganizations instead of breaking again.
+# --- Dynamic binary discovery (build-time), CUDA-aware ------------------
+# Confirmed empirically on 2026-09-22: this image contains more than one
+# file named "llama-server". A naive "find ... | head -n 1" picked a
+# non-CUDA build -- its --version output had zero mention of CUDA, while
+# nvidia-smi correctly saw the GPU at runtime. A file being NAMED
+# llama-server does not mean it was compiled with CUDA support.
+#
+# Fix: enumerate ALL matching files (written to a temp file, not piped
+# directly into the while loop -- piping into a while loop creates a
+# subshell in POSIX sh, which would silently discard the FOUND_BIN
+# variable the moment the loop ends). For each candidate, check its
+# dynamic library dependencies via ldd for a CUDA runtime reference.
+# This works at BUILD time with no GPU present, unlike --version's
+# device-enumeration output, which needs real GPU hardware to say
+# anything CUDA-related at all.
 RUN set -eu; \
-    FOUND_BIN="$(find / -xdev -maxdepth 6 -type f -name 'llama-server' 2>/dev/null | head -n 1)"; \
-    if [ -z "$FOUND_BIN" ]; then \
-        echo "BUILD ERROR: llama-server binary not found anywhere in the" >&2; \
-        echo "base image (searched depth 6 from /). Inspect manually with:" >&2; \
-        echo "  docker run --rm --entrypoint sh ghcr.io/ggml-org/llama.cpp:server-cuda -c 'find / -xdev -iname \"*llama*\" -type f 2>/dev/null'" >&2; \
+    CANDIDATES_FILE="$(mktemp)"; \
+    find / -xdev -maxdepth 6 -type f -name 'llama-server' 2>/dev/null > "$CANDIDATES_FILE"; \
+    if [ ! -s "$CANDIDATES_FILE" ]; then \
+        echo "BUILD ERROR: no file named llama-server found anywhere in" >&2; \
+        echo "the base image (searched depth 6 from /)." >&2; \
         exit 1; \
     fi; \
-    if [ ! -x "$FOUND_BIN" ]; then chmod +x "$FOUND_BIN"; fi; \
-    echo "Found llama-server at: ${FOUND_BIN}"; \
+    echo "Candidates found:"; cat "$CANDIDATES_FILE"; \
+    FOUND_BIN=""; \
+    while IFS= read -r c; do \
+        [ -z "$c" ] && continue; \
+        [ ! -x "$c" ] && chmod +x "$c" 2>/dev/null || true; \
+        LDD_OUT="$(ldd "$c" 2>&1 || true)"; \
+        echo "-- ldd for ${c}:"; echo "$LDD_OUT"; \
+        if echo "$LDD_OUT" | grep -qiE 'libcudart|libcublas|libcuda\.so'; then \
+            FOUND_BIN="$c"; \
+            echo "Selected CUDA-linked binary: ${FOUND_BIN}"; \
+            break; \
+        fi; \
+    done < "$CANDIDATES_FILE"; \
+    rm -f "$CANDIDATES_FILE"; \
+    if [ -z "$FOUND_BIN" ]; then \
+        echo "BUILD ERROR: none of the candidates are linked against a" >&2; \
+        echo "CUDA runtime library (checked for libcudart, libcublas," >&2; \
+        echo "libcuda.so via ldd). This base image tag may not actually" >&2; \
+        echo "ship a CUDA-enabled llama-server right now." >&2; \
+        exit 1; \
+    fi; \
     ln -sf "$FOUND_BIN" /usr/local/bin/llama-server; \
     echo "$FOUND_BIN" > /usr/local/share/llama-server.origin
 
