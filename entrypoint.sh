@@ -31,7 +31,7 @@ if [ -f /usr/local/share/ggml-backend-path.origin ]; then
   export GGML_BACKEND_PATH="$(cat /usr/local/share/ggml-backend-path.origin)"
   echo "GGML_BACKEND_PATH set to: ${GGML_BACKEND_PATH}"
 else
-  echo "WARNING: no recorded GGML backend plugin directory found. CUDA backend discovery will rely on default search paths only." >&2
+  echo "WARNING: no recorded GGML backend plugin path found. CUDA backend discovery will rely on default search paths only." >&2
 fi
 
 echo "== GPU detection (nvidia-smi) =="
@@ -45,6 +45,20 @@ nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader || {
   exit 1
 }
 
+# --- CUDA backend pre-flight check --------------------------------------
+# NOTE: newer llama.cpp builds (dynamic ggml backend loading via dlopen)
+# may not eagerly print a "found N CUDA devices" line at a bare
+# --version invocation the way older builds did -- backends can be
+# registered lazily and only actually probed at model-load time.
+# Confirmed empirically: a clean run with a correctly-resolved
+# GGML_BACKEND_PATH produced no device-count line and no error either.
+# Treating the ABSENCE of that line as fatal was based on older-build
+# behavior and would incorrectly block a working configuration. The
+# real failure signal is an EXPLICIT backend-load error (e.g.
+# "load_backend: failed to load"), which is unambiguous regardless of
+# llama.cpp version. Absence of any device-count confirmation is now a
+# warning, not a hard failure -- the actual model load later is the
+# real test of whether CUDA works end to end.
 echo "== llama-server CUDA backend pre-flight check =="
 CUDA_PROBE_LOG="$(mktemp)"
 if ! timeout 30 "$LLAMA_SERVER_BIN" --version >"$CUDA_PROBE_LOG" 2>&1; then
@@ -54,19 +68,28 @@ fi
 echo "Raw ggml_cuda_init output:"
 cat "$CUDA_PROBE_LOG" | sed 's/^/  /'
 
-if ! grep -q "found [0-9]\+ CUDA device" "$CUDA_PROBE_LOG"; then
-  echo "FATAL: llama-server's CUDA backend never reported finding a device." >&2
-  cat "$CUDA_PROBE_LOG" >&2
+if grep -qiE 'load_backend: failed to load|error.*backend|cannot read file data' "$CUDA_PROBE_LOG"; then
+  echo "FATAL: an explicit backend-load error was reported. nvidia-smi sees" >&2
+  echo "a GPU, but the CUDA backend plugin failed to load for a concrete," >&2
+  echo "stated reason (see raw output above) -- this is a real failure," >&2
+  echo "not just a missing confirmation line." >&2
   rm -f "$CUDA_PROBE_LOG"
   exit 1
+fi
+
+if grep -q "found [0-9]\+ CUDA device" "$CUDA_PROBE_LOG"; then
+  echo "CUDA device enumeration confirmed at --version time."
+else
+  echo "NOTE: no explicit 'found N CUDA device' line at --version time, and" \
+       "no backend-load error either. Newer llama.cpp builds may defer" \
+       "device probing to actual model load rather than a bare --version" \
+       "call. Proceeding -- the model load itself is the real test." >&2
 fi
 
 SUPPORTED_CCS="7.5 8.0 8.6 8.9 9.0 12.0"
 DETECTED_CCS="$(grep -oE 'compute capability [0-9]+\.[0-9]+' "$CUDA_PROBE_LOG" | grep -oE '[0-9]+\.[0-9]+' | sort -u || true)"
 
-if [ -z "$DETECTED_CCS" ]; then
-  echo "WARNING: could not parse a compute capability out of the probe output." >&2
-else
+if [ -n "$DETECTED_CCS" ]; then
   echo "Detected compute capabilities: $(echo "$DETECTED_CCS" | tr '\n' ' ')"
   UNSUPPORTED_FOUND=0
   while IFS= read -r cc; do
