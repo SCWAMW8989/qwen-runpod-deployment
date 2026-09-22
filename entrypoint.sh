@@ -45,20 +45,6 @@ nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader || {
   exit 1
 }
 
-# --- CUDA backend pre-flight check --------------------------------------
-# NOTE: newer llama.cpp builds (dynamic ggml backend loading via dlopen)
-# may not eagerly print a "found N CUDA devices" line at a bare
-# --version invocation the way older builds did -- backends can be
-# registered lazily and only actually probed at model-load time.
-# Confirmed empirically: a clean run with a correctly-resolved
-# GGML_BACKEND_PATH produced no device-count line and no error either.
-# Treating the ABSENCE of that line as fatal was based on older-build
-# behavior and would incorrectly block a working configuration. The
-# real failure signal is an EXPLICIT backend-load error (e.g.
-# "load_backend: failed to load"), which is unambiguous regardless of
-# llama.cpp version. Absence of any device-count confirmation is now a
-# warning, not a hard failure -- the actual model load later is the
-# real test of whether CUDA works end to end.
 echo "== llama-server CUDA backend pre-flight check =="
 CUDA_PROBE_LOG="$(mktemp)"
 if ! timeout 30 "$LLAMA_SERVER_BIN" --version >"$CUDA_PROBE_LOG" 2>&1; then
@@ -69,10 +55,7 @@ echo "Raw ggml_cuda_init output:"
 cat "$CUDA_PROBE_LOG" | sed 's/^/  /'
 
 if grep -qiE 'load_backend: failed to load|error.*backend|cannot read file data' "$CUDA_PROBE_LOG"; then
-  echo "FATAL: an explicit backend-load error was reported. nvidia-smi sees" >&2
-  echo "a GPU, but the CUDA backend plugin failed to load for a concrete," >&2
-  echo "stated reason (see raw output above) -- this is a real failure," >&2
-  echo "not just a missing confirmation line." >&2
+  echo "FATAL: an explicit backend-load error was reported." >&2
   rm -f "$CUDA_PROBE_LOG"
   exit 1
 fi
@@ -81,9 +64,8 @@ if grep -q "found [0-9]\+ CUDA device" "$CUDA_PROBE_LOG"; then
   echo "CUDA device enumeration confirmed at --version time."
 else
   echo "NOTE: no explicit 'found N CUDA device' line at --version time, and" \
-       "no backend-load error either. Newer llama.cpp builds may defer" \
-       "device probing to actual model load rather than a bare --version" \
-       "call. Proceeding -- the model load itself is the real test." >&2
+       "no backend-load error either. Proceeding -- the model load itself" \
+       "is the real test." >&2
 fi
 
 SUPPORTED_CCS="7.5 8.0 8.6 8.9 9.0 12.0"
@@ -115,7 +97,6 @@ mapfile -t GPU_MEM_MIB < <(nvidia-smi --query-gpu=memory.total --format=csv,nohe
 GPU_COUNT=${#GPU_MEM_MIB[@]}
 if [ "$GPU_COUNT" -eq 0 ]; then
   echo "FATAL: nvidia-smi produced no parseable numeric VRAM readings." >&2
-  nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits >&2 || true
   exit 1
 fi
 
@@ -187,10 +168,35 @@ else
 fi
 
 HF_FILE="RVN-${QUANT}.gguf"
+MODEL_URL="https://huggingface.co/${REPO}/resolve/main/${HF_FILE}"
+MODEL_LOCAL_PATH="${CACHE_DIR}/${HF_FILE}"
 
 echo "Selected quant tier: ${QUANT}  (exact file: ${HF_FILE})"
 
 : "${API_KEY:?Set the API_KEY environment variable on the RunPod pod before starting.}"
+
+# Fixed: pre-download the main GGUF with our own curl + retry logic
+# instead of passing -hf/--hf-file and relying on llama-server's
+# internal downloader. Confirmed failure mode: a transient DNS/network
+# hiccup (the same kind that briefly hit the much smaller mmproj
+# download and self-recovered via our retry flags) caused the internal
+# downloader to hang indefinitely with zero log output and no timeout,
+# for many minutes, on a multi-GB file. Using the same curl mechanism
+# that already works reliably for the projector removes this entire
+# class of failure for the main model too.
+if [ -f "$MODEL_LOCAL_PATH" ]; then
+  echo "Main model already cached at ${MODEL_LOCAL_PATH}."
+else
+  echo "Downloading main model to ${MODEL_LOCAL_PATH} (this is a large file, expect several minutes)..."
+  if ! curl -fL --retry 5 --retry-delay 10 --connect-timeout 30 --max-time 3600 \
+       -o "$MODEL_LOCAL_PATH" "$MODEL_URL"; then
+    echo "FATAL: main model download failed after retries. Check network" >&2
+    echo "connectivity from this pod to huggingface.co." >&2
+    rm -f "$MODEL_LOCAL_PATH"
+    exit 1
+  fi
+  echo "Main model download succeeded."
+fi
 
 MMPROJ_FLAG="--no-mmproj"
 if [ "$VISION_ACTIVE" -eq 1 ]; then
@@ -224,16 +230,14 @@ fi
 
 echo "== Launching llama-server =="
 echo "  binary     : ${LLAMA_SERVER_BIN}"
-echo "  repo       : ${REPO}"
-echo "  hf-file    : ${HF_FILE}"
+echo "  model file : ${MODEL_LOCAL_PATH}"
 echo "  ctx-size   : ${CTX_SIZE}"
 echo "  cache dir  : ${LLAMA_CACHE}"
 echo "  gpu count  : ${GPU_COUNT}"
 echo "  vision     : ${VISION_ACTIVE}"
 
 exec "$LLAMA_SERVER_BIN" \
-  -hf "${REPO}" \
-  --hf-file "${HF_FILE}" \
+  -m "${MODEL_LOCAL_PATH}" \
   --host 0.0.0.0 \
   --port 8080 \
   --ctx-size "${CTX_SIZE}" \
